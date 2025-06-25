@@ -1,9 +1,13 @@
-<script setup>
-import TheWelcome from '../components/TheWelcome.vue'
-</script>
-
 <template>
-  <main>
-    <TheWelcome />
-  </main>
+	<TextToSpeech />
 </template>
+
+<script>
+import TextToSpeech from '../components/TextToSpeech.vue'
+
+export default {
+	components: {
+		TextToSpeech
+	}
+}
+</script>
