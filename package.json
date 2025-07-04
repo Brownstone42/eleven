@@ -10,6 +10,7 @@
     "format": "prettier --write src/"
   },
   "dependencies": {
+    "@elevenlabs/client": "^0.1.7",
     "bulma": "^1.0.4",
     "dotenv": "^16.5.0",
     "elevenlabs": "^1.59.0",
