@@ -1,16 +1,16 @@
 <template>
     <section class="section">
         <div class="container">
-            <h1 class="title">🎙️ Text to Speech</h1>
+            <h1 class="title">🎙️ AI Voice Conversation</h1>
 
             <div class="field">
-                <label class="label">Enter Text</label>
+                <label class="label">Enter Text (for ElevenLabs)</label>
                 <div class="control">
                     <textarea
                         class="textarea"
                         v-model="text"
-                        placeholder="Type something to convert to speech..."
-                        rows="5"
+                        placeholder="Type something to convert to speech via ElevenLabs..."
+                        rows="3"
                     ></textarea>
                 </div>
             </div>
@@ -22,38 +22,69 @@
                     </button>
 
                     <button class="button is-link ml-4" @click="startConversation">
-                        {{ 'Start Conversation' }}
+                        {{ 'Start (ElevenLab)' }}
                     </button>
 
                     <button class="button is-link ml-4" @click="stopConversation">
-                        {{ 'Stop Conversation' }}
+                        {{ 'Stop (ElevenLab)' }}
                     </button>
 
-                    <button class="button is-link ml-4" @click="talk">
-                        {{ isRecording ? 'Stop Talking' : 'Talk' }}
+                    <button class="button is-link ml-4"
+                        @click="startVoiceConversation"
+                        :disabled="isListening || loading || isSpeaking || (webSocket && webSocket.readyState === 1)">
+                        {{ isListening ? 'Listening...' : (loading ? 'AI Thinking...' : (isSpeaking ? 'AI Speaking...' : 'Start AI Conversation')) }}
+                    </button>
+
+                    <button class="button is-link ml-4"
+                        @click="stopVoiceConversation"
+                        :disabled="!webSocket || webSocket.readyState !== 1">
+                        Stop AI Conversation
                     </button>
                 </div>
             </div>
 
-            <div class="field" v-if="transcribedText || sttError">
-                <label class="label">Transcribed Text</label>
+            <div class="field" v-if="currentInterimTranscript || sttError">
+                <label class="label">Your Live Transcription:</label>
                 <div class="control">
-                    <textarea
-                        class="textarea"
-                        :value="transcribedText"
-                        readonly
-                        rows="3"
-                    ></textarea>
+                    <textarea class="textarea" :value="currentInterimTranscript" readonly rows="2"></textarea>
                 </div>
                 <p class="help is-danger" v-if="sttError">{{ sttError }}</p>
             </div>
 
-            <div class="field" v-if="audioUrl">
-                <label class="label">Playback</label>
+            <div class="field">
+                <label class="label">Conversation History:</label>
+                <div class="control" style="max-height: 400px; overflow-y: auto; background-color: #f9f9f9; padding: 10px; border-radius: 4px;">
+                    <div v-for="(message, index) in chatHistory" :key="index"
+                         :class="{'has-text-right': message.type === 'user', 'has-text-left': message.type === 'ai'}"
+                         style="margin-bottom: 8px;">
+                        <span :class="{'tag is-info is-light': message.type === 'user', 'tag is-primary is-light': message.type === 'ai'}"
+                              style="padding: 8px 12px; border-radius: 16px;">
+                            {{ message.text }}
+                        </span>
+                    </div>
+                    <!-- Display interim transcription as user speaks (if available and AI is not speaking/thinking) -->
+                    <div v-if="currentInterimTranscript && !isSpeaking && isListening" class="has-text-right" style="margin-bottom: 8px;">
+                        <span class="tag is-info is-light" style="padding: 8px 12px; border-radius: 16px; opacity: 0.7;">
+                            {{ currentInterimTranscript }}...
+                        </span>
+                    </div>
+                    <!-- Display AI thinking status -->
+                    <div v-if="loading" class="has-text-left" style="margin-bottom: 8px;">
+                        <span class="tag is-primary is-light" style="padding: 8px 12px; border-radius: 16px; opacity: 0.7;">
+                            AI Thinking...
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="field" v-if="audioUrl && !isSpeaking">
+                <label class="label">Playback (ElevenLabs)</label>
                 <div class="control">
                     <audio :src="audioUrl" controls autoplay></audio>
                 </div>
             </div>
+
+            <audio ref="aiAudioPlayer" style="display: none;"></audio>
         </div>
     </section>
 </template>
@@ -73,7 +104,8 @@ export default {
             // --- New properties for STT ---
             mediaRecorder: null,
             audioChunks: [],
-            isRecording: false, // To track recording state
+            isListening: false,
+            isSpeaking: false,
             transcribedText: '', // To store the text from STT
             sttError: '', // To show STT-related errors
 
@@ -82,76 +114,187 @@ export default {
             audioContext: null,
             mediaStreamSource: null,
             processor: null,
+
+            chatHistory: [],
+            currentInterimTranscript: ''
         }
     },
     beforeUnmount() {
-        this.stopAudioStreaming()
-        if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
-            this.webSocket.close()
-        }
+        this.stopVoiceConversation()
     },
     methods: {
-        async talk() {
+        base64ToBlob(base64, mimeType) {
+            const byteCharacters = atob(base64)
+            const byteNumbers = new Array(byteCharacters.length)
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i)
+            }
+            const byteArray = new Uint8Array(byteNumbers)
+            return new Blob([byteArray], { type: mimeType })
+        },
+        async startVoiceConversation() {
             try {
-                if (!this.isRecording) {
-                    // --- Start Recording ---
-                    this.sttError = '' // Clear previous errors
-                    this.transcribedText = '' // Clear previous text
-                    this.audioChunks = [] // Clear previous audio chunks
+                if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
+                    console.log('AI Voice Conversation already started.')
+                    return
+                }
 
-                    this.webSocket = new WebSocket('ws://localhost:3001')
+                this.sttError = ''
+                this.transcribedText = ''
+                this.currentInterimTranscript = ''
+                this.chatHistory = []
+                this.loading = false
+                this.isSpeaking = false
 
-                    this.webSocket.onopen = () => {
-                        console.log('WebSocket connected.')
-                        this.isRecording = true // Set recording state after connection is open
-                        // Start audio processing only after WebSocket is open
-                        this.startAudioStreaming()
-                    }
+                // 1. Establish WebSocket Connection
+                this.webSocket = new WebSocket('ws://localhost:3001')
 
-                    this.webSocket.onmessage = (event) => {
-                        // This is where we'll receive transcribed text from the backend
-                        const data = JSON.parse(event.data)
-                        if (data.transcribedText) {
+                this.webSocket.onopen = () => {
+                    console.log('WebSocket connected. Starting audio streaming for AI Voice Conversation.')
+                    this.startAudioStreaming() // Start microphone audio capture
+                    this.isListening = true // Ready to listen for user input
+                }
+
+                this.webSocket.onmessage = async (event) => {
+                    const data = JSON.parse(event.data)
+
+                    if (data.transcribedText) {
+                        this.currentInterimTranscript = data.transcribedText
+
+                        if (data.isFinal) {
                             this.transcribedText = data.transcribedText
-                            //console.log('Received Transcribed Text:', this.transcribedText)
+                            console.log('Received FINAL Transcribed Text:', this.transcribedText)
+
+                            // Add user's final utterance to chat history
+                            this.chatHistory.push({ type: 'user', text: this.transcribedText })
+                            this.currentInterimTranscript = '' // Clear interim after final
+                            this.transcribedText = '' // Clear for next turn
+
+                            this.loading = true
+                            this.isListening = false
                         }
-                    }
+                    } else if (data.aiAudioBase64) {
+                        console.log('Received AI Audio Base64. Playing audio...')
+                        this.loading = false // AI finished thinking
 
-                    this.webSocket.onclose = () => {
-                        console.log('WebSocket disconnected.')
-                        this.stopAudioStreaming() // Ensure audio streaming stops
-                        this.isRecording = false // Reset recording state
-                    }
+                        if (data.aiResponseText) {
+                            this.chatHistory.push({ type: 'ai', text: data.aiResponseText })
+                        } else {
+                            this.chatHistory.push({ type: 'ai', text: 'AI responded with audio.' })
+                        }
 
-                    this.webSocket.onerror = (error) => {
-                        console.error('WebSocket error:', error)
-                        this.sttError = `WebSocket error: ${error.message || 'Unknown error'}`
-                        this.stopAudioStreaming() // Ensure audio streaming stops
-                        this.isRecording = false // Reset recording state
+                        const audioPlayer = this.$refs.aiAudioPlayer
+                        //console.log(audioPlayer)
+
+                        if (audioPlayer) {
+                            audioPlayer.src = URL.createObjectURL(this.base64ToBlob(data.aiAudioBase64, 'audio/mpeg'))
+
+                            audioPlayer.onplay = () => {
+                                this.isSpeaking = true // AI is speaking
+                                console.log('AI audio started playing.')
+                            }
+
+                            audioPlayer.onended = () => {
+                                this.isSpeaking = false
+                                this.isListening = true
+
+                                console.log('AI audio finished playing. Ready for next user input.')
+                                if (this.audioUrl) {
+                                    URL.revokeObjectURL(this.audioUrl)
+                                    this.audioUrl = null
+                                }
+                            }
+
+                            audioPlayer.onerror = (e) => {
+                                console.error('Audio playback error:', e)
+                                this.sttError = 'Error playing AI audio.'
+                                this.isSpeaking = false
+                                this.isListening = true
+                            }
+                            audioPlayer.play()
+                        }
+                    } else if (data.aiResponseText) {
+                        console.log('Received AI Text Response (no audio yet):', data.aiResponseText)
+                        this.chatHistory.push({ type: 'ai', text: data.aiResponseText })
+                        this.loading = false
+                        this.isListening = true
+                    } else if (data.error) {
+                        console.error('WebSocket Error from Backend:', data.error)
+                        this.sttError = `Backend error: ${data.error}`
+                        this.loading = false
+                        this.isListening = true
                     }
-                } else {
-                    // --- Stop Recording & Close WebSocket ---
+                }
+
+                this.webSocket.onclose = () => {
+                    console.log('WebSocket disconnected.')
                     this.stopAudioStreaming()
+                    this.isListening = false
+                    this.loading = false
+                    this.isSpeaking = false // Ensure speaking state is reset
+                }
 
-                    if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
-                        this.webSocket.close()
-                    }
-
-                    this.isRecording = false
-                    console.log('Stopped talking and closed WebSocket.')
+                this.webSocket.onerror = (error) => {
+                    console.error('WebSocket error:', error)
+                    this.sttError = `WebSocket error: ${error.message || 'Unknown error'}`
+                    this.stopAudioStreaming()
+                    this.isListening = false
+                    this.loading = false
+                    this.isSpeaking = false // Ensure speaking state is reset
                 }
             } catch (err) {
-                console.error('Error starting talk session:', err)
+                console.error('Error starting voice conversation:', err)
                 this.sttError = `Error: ${err.message}`
-                this.isRecording = false
+                this.isListening = false
+                this.loading = false
+                this.isSpeaking = false
             }
+        },
+        async stopVoiceConversation() {
+            if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
+                this.webSocket.close()
+            }
+
+            this.stopAudioStreaming() // Ensure microphone is off
+            this.isListening = false
+            this.isSpeaking = false
+            this.loading = false
+            this.transcribedText = ''
+            this.currentInterimTranscript = ''
+            this.sttError = ''
+            this.chatHistory = []
+
+            const aiAudioPlayer = this.$refs.aiAudioPlayer
+
+            if (aiAudioPlayer) {
+
+                aiAudioPlayer.onplay = null
+                aiAudioPlayer.onended = null
+                aiAudioPlayer.onerror = null
+
+                if (!aiAudioPlayer.paused) {
+                    aiAudioPlayer.pause()
+                    aiAudioPlayer.currentTime = 0
+                }
+                if (aiAudioPlayer.src) {
+                    URL.revokeObjectURL(aiAudioPlayer.src)
+                    aiAudioPlayer.src = ''
+                }
+            }
+
+            if (this.audioUrl) {
+                URL.revokeObjectURL(this.audioUrl)
+                this.audioUrl = null
+            }
+
+            console.log('Conversation session fully ended.')
         },
         async startAudioStreaming() {
             try {
                 // Try to set the desired sample rate for the AudioContext
                 this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
                     sampleRate: 16000,
-                }) // <--- ADD THIS
+                })
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
                 this.mediaStreamSource = this.audioContext.createMediaStreamSource(stream)
 
@@ -161,35 +304,17 @@ export default {
                 this.processor = this.audioContext.createScriptProcessor(4096, 1, 1)
 
                 this.processor.onaudioprocess = (event) => {
-                    if (
-                        !this.isRecording ||
-                        !this.webSocket ||
-                        this.webSocket.readyState !== WebSocket.OPEN
-                    ) {
-                        return
-                    }
+                    // Only send audio if we are in a listening state and AI is not speaking
+                    // This prevents sending audio while AI is generating a response or speaking
+                    if (this.isListening && !this.isSpeaking && this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
+                        const inputBuffer = event.inputBuffer.getChannelData(0)
+                        const pcm16 = new Int16Array(inputBuffer.length)
 
-                    // Get the raw audio data (Float32Array) from the input buffer
-                    const inputBuffer = event.inputBuffer.getChannelData(0)
-                    /*console.log(
-                        'Audio inputBuffer length:',
-                        inputBuffer.length,
-                        'First value:',
-                        inputBuffer[0],
-                    )*/
+                        for (let i = 0; i < inputBuffer.length; i++) {
+                            pcm16[i] = Math.max(-1, Math.min(1, inputBuffer[i])) * 0x7FFF
+                        }
 
-                    // Convert Float32Array to 16-bit PCM (Int16Array)
-                    // Google STT expects LINEAR16, which is 16-bit signed integers
-                    const pcm16 = new Int16Array(inputBuffer.length)
-                    for (let i = 0; i < inputBuffer.length; i++) {
-                        pcm16[i] = Math.max(-1, Math.min(1, inputBuffer[i])) * 0x7fff // Scale to 16-bit range
-                    }
-
-                    //console.log('PCM16 buffer length:', pcm16.length, 'First value:', pcm16[0])
-
-                    if (this.webSocket.readyState === WebSocket.OPEN) {
                         this.webSocket.send(pcm16.buffer)
-                        //console.log('Sent audio chunk to WebSocket.')
                     }
                 }
 
@@ -197,7 +322,7 @@ export default {
                 this.mediaStreamSource.connect(this.processor)
                 this.processor.connect(this.audioContext.destination)
 
-                console.log('Audio streaming started.')
+                console.log('Audio streaming to WebSocket started for AI Voice Conversation.')
             } catch (err) {
                 console.error('Error starting audio streaming:', err)
                 this.sttError = `Audio streaming error: ${err.message}`
@@ -225,7 +350,7 @@ export default {
                 this.audioContext.close()
                 this.audioContext = null
             }
-            console.log('Audio streaming stopped.')
+            console.log('Audio streaming stopped for AI Voice Conversation.')
         },
         async startConversation() {
             try {
@@ -304,3 +429,28 @@ export default {
     },
 }
 </script>
+
+<style scoped>
+.tag {
+    white-space: normal; /* Allow text to wrap */
+    height: auto; /* Adjust height based on content */
+    padding: 8px 12px; /* More padding for better look */
+    line-height: 1.5; /* Improve readability */
+    word-wrap: break-word; /* Break long words */
+    font-size: 0.9rem; /* Slightly smaller font for chat bubbles */
+}
+.has-text-right .tag {
+    background-color: #e6f7ff; /* Light blue for user */
+    color: #1890ff;
+    border-radius: 16px 16px 4px 16px; /* Rounded corners with one flat edge */
+}
+.has-text-left .tag {
+    background-color: #f6ffed; /* Light green for AI */
+    color: #52c41a;
+    border-radius: 16px 16px 16px 4px; /* Rounded corners with one flat edge */
+}
+/* Ensure the control div for chat history has some padding */
+.control[style*="max-height: 400px"] {
+    padding: 15px;
+}
+</style>
